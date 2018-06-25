@@ -21,6 +21,7 @@
 package com.github.shadowsocks.plugin
 
 import android.annotation.SuppressLint
+import android.content.BroadcastReceiver
 import android.content.ContentResolver
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -31,6 +32,7 @@ import android.util.Base64
 import android.util.Log
 import com.github.shadowsocks.App.Companion.app
 import com.github.shadowsocks.utils.Commandline
+import com.github.shadowsocks.utils.signaturesCompat
 import eu.chainfire.libsuperuser.Shell
 import java.io.File
 import java.io.FileNotFoundException
@@ -46,7 +48,7 @@ object PluginManager {
      * public key yet since it will also automatically trust packages signed by the same signatures, e.g. debug keys.
      */
     val trustedSignatures by lazy {
-        app.info.signatures.toSet() +
+        app.info.signaturesCompat.toSet() +
                 Signature(Base64.decode(  // @Mygod
                 """
                     |MIIDWzCCAkOgAwIBAgIEUzfv8DANBgkqhkiG9w0BAQsFADBdMQswCQYDVQQGEwJD
@@ -84,18 +86,21 @@ object PluginManager {
                   """, Base64.DEFAULT))
     }
 
-    private val receiver by lazy { app.listenForPackageChanges { synchronized(this) { cachedPlugins = null } } }
+    private var receiver: BroadcastReceiver? = null
     private var cachedPlugins: Map<String, Plugin>? = null
-    fun fetchPlugins(): Map<String, Plugin> {
-        receiver
-        return synchronized(this) {
-            if (cachedPlugins == null) {
-                val pm = app.packageManager
-                cachedPlugins = (pm.queryIntentContentProviders(Intent(PluginContract.ACTION_NATIVE_PLUGIN),
-                        PackageManager.GET_META_DATA).map { NativePlugin(it) } + NoPlugin).associate { it.id to it }
+    fun fetchPlugins(): Map<String, Plugin> = synchronized(this) {
+        if (receiver == null) receiver = app.listenForPackageChanges {
+            synchronized(this) {
+                receiver = null
+                cachedPlugins = null
             }
-            cachedPlugins!!
         }
+        if (cachedPlugins == null) {
+            val pm = app.packageManager
+            cachedPlugins = (pm.queryIntentContentProviders(Intent(PluginContract.ACTION_NATIVE_PLUGIN),
+                    PackageManager.GET_META_DATA).map { NativePlugin(it) } + NoPlugin).associate { it.id to it }
+        }
+        cachedPlugins!!
     }
 
     private fun buildUri(id: String) = Uri.Builder()
@@ -128,10 +133,10 @@ object PluginManager {
     private fun initNative(options: PluginOptions): String? {
         val providers = app.packageManager.queryIntentContentProviders(
                 Intent(PluginContract.ACTION_NATIVE_PLUGIN, buildUri(options.id)), 0)
-        assert(providers.size == 1)
+        if (providers.isEmpty()) return null
         val uri = Uri.Builder()
                 .scheme(ContentResolver.SCHEME_CONTENT)
-                .authority(providers[0].providerInfo.authority)
+                .authority(providers.single().providerInfo.authority)
                 .build()
         val cr = app.contentResolver
         return try {
@@ -148,7 +153,7 @@ object PluginManager {
         out.putString(PluginContract.EXTRA_OPTIONS, options.id)
         val result = cr.call(uri, PluginContract.METHOD_GET_EXECUTABLE, null, out)
                 .getString(PluginContract.EXTRA_ENTRY)
-        assert(File(result).canExecute())
+        check(File(result).canExecute())
         return result
     }
 
@@ -167,7 +172,7 @@ object PluginManager {
             do {
                 val path = cursor.getString(0)
                 val file = File(pluginDir, path)
-                assert(file.absolutePath.startsWith(pluginDirPath))
+                check(file.absolutePath.startsWith(pluginDirPath))
                 cr.openInputStream(uri.buildUpon().path(path).build()).use { inStream ->
                     file.outputStream().use { outStream -> inStream.copyTo(outStream) }
                 }

@@ -27,13 +27,13 @@ import android.annotation.SuppressLint
 import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
-import android.content.Context
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
 import android.graphics.drawable.Drawable
 import android.os.Bundle
 import android.os.Handler
+import android.support.design.widget.Snackbar
 import android.support.v4.app.TaskStackBuilder
 import android.support.v7.app.AppCompatActivity
 import android.support.v7.widget.DefaultItemAnimator
@@ -43,16 +43,12 @@ import android.support.v7.widget.Toolbar
 import android.view.*
 import android.widget.ImageView
 import android.widget.Switch
-import android.widget.Toast
 import com.futuremind.recyclerviewfastscroll.FastScroller
 import com.futuremind.recyclerviewfastscroll.SectionTitleProvider
 import com.github.shadowsocks.App.Companion.app
 import com.github.shadowsocks.database.ProfileManager
 import com.github.shadowsocks.preference.DataStore
-import com.github.shadowsocks.utils.DirectBoot
-import com.github.shadowsocks.utils.Key
-import com.github.shadowsocks.utils.resolveResourceId
-import com.github.shadowsocks.utils.thread
+import com.github.shadowsocks.utils.*
 import java.util.concurrent.atomic.AtomicBoolean
 
 class AppManager : AppCompatActivity(), Toolbar.OnMenuItemClickListener {
@@ -62,20 +58,21 @@ class AppManager : AppCompatActivity(), Toolbar.OnMenuItemClickListener {
 
         private var receiver: BroadcastReceiver? = null
         private var cachedApps: List<PackageInfo>? = null
-        private fun getApps(pm: PackageManager): List<ProxiedApp> {
+        private fun getApps(pm: PackageManager) = synchronized(AppManager) {
             if (receiver == null) receiver = app.listenForPackageChanges {
-                synchronized(AppManager) { cachedApps = null }
+                synchronized(AppManager) {
+                    receiver = null
+                    cachedApps = null
+                }
                 AppManager.instance?.reloadApps()
             }
-            return synchronized(AppManager) {
-                // Labels and icons can change on configuration (locale, etc.) changes, therefore they are not cached.
-                val cachedApps = cachedApps ?: pm.getInstalledPackages(PackageManager.GET_PERMISSIONS)
-                        .filter { it.packageName != app.packageName &&
-                                it.requestedPermissions?.contains(Manifest.permission.INTERNET) ?: false }
-                this.cachedApps = cachedApps
-                cachedApps
-            }.map { ProxiedApp(pm, it.applicationInfo, it.packageName) }
-        }
+            // Labels and icons can change on configuration (locale, etc.) changes, therefore they are not cached.
+            val cachedApps = cachedApps ?: pm.getInstalledPackages(PackageManager.GET_PERMISSIONS)
+                    .filter { it.packageName != app.packageName &&
+                            it.requestedPermissions?.contains(Manifest.permission.INTERNET) ?: false }
+            this.cachedApps = cachedApps
+            cachedApps
+        }.map { ProxiedApp(pm, it.applicationInfo, it.packageName) }
     }
 
     private class ProxiedApp(private val pm: PackageManager, private val appInfo: ApplicationInfo,
@@ -139,7 +136,7 @@ class AppManager : AppCompatActivity(), Toolbar.OnMenuItemClickListener {
     private lateinit var loadingView: View
     private val appsLoading = AtomicBoolean()
     private val handler = Handler()
-    private val clipboard by lazy { getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager }
+    private val clipboard by lazy { systemService<ClipboardManager>() }
 
     private fun initProxiedApps(str: String = DataStore.individual) {
         proxiedApps = str.split('\n').toHashSet()
@@ -152,7 +149,7 @@ class AppManager : AppCompatActivity(), Toolbar.OnMenuItemClickListener {
         appListView.visibility = View.GONE
         fastScroller.visibility = View.GONE
         loadingView.visibility = View.VISIBLE
-        thread {
+        thread("AppManager-loader") {
             val adapter = appListView.adapter as AppsAdapter
             do {
                 appsLoading.set(true)
@@ -231,14 +228,14 @@ class AppManager : AppCompatActivity(), Toolbar.OnMenuItemClickListener {
                         ProfileManager.updateProfile(it)
                     }
                     if (DataStore.directBootAware) DirectBoot.update()
-                    Toast.makeText(this, R.string.action_apply_all, Toast.LENGTH_SHORT).show()
-                } else Toast.makeText(this, R.string.action_export_err, Toast.LENGTH_SHORT).show()
+                    Snackbar.make(appListView, R.string.action_apply_all, Snackbar.LENGTH_LONG).show()
+                } else Snackbar.make(appListView, R.string.action_export_err, Snackbar.LENGTH_LONG).show()
                 return true
             }
             R.id.action_export -> {
                 clipboard.primaryClip = ClipData.newPlainText(Key.individual,
                         "${DataStore.bypass}\n${DataStore.individual}")
-                Toast.makeText(this, R.string.action_export_msg, Toast.LENGTH_SHORT).show()
+                Snackbar.make(appListView, R.string.action_export_msg, Snackbar.LENGTH_LONG).show()
                 return true
             }
             R.id.action_import -> {
@@ -251,23 +248,21 @@ class AppManager : AppCompatActivity(), Toolbar.OnMenuItemClickListener {
                         bypassSwitch.isChecked = enabled.toBoolean()
                         DataStore.individual = apps
                         DataStore.dirty = true
-                        Toast.makeText(this, R.string.action_import_msg, Toast.LENGTH_SHORT).show()
+                        Snackbar.make(appListView, R.string.action_import_msg, Snackbar.LENGTH_LONG).show()
                         initProxiedApps(apps)
                         reloadApps()
                         return true
                     } catch (_: IllegalArgumentException) { }
                 }
-                Toast.makeText(this, R.string.action_import_err, Toast.LENGTH_SHORT).show()
+                Snackbar.make(appListView, R.string.action_import_err, Snackbar.LENGTH_LONG).show()
             }
         }
         return false
     }
 
-    override fun onKeyUp(keyCode: Int, event: KeyEvent?): Boolean {
-        return if (keyCode == KeyEvent.KEYCODE_MENU)
-            if (toolbar.isOverflowMenuShowing) toolbar.hideOverflowMenu() else toolbar.showOverflowMenu()
-        else super.onKeyUp(keyCode, event)
-    }
+    override fun onKeyUp(keyCode: Int, event: KeyEvent?) = if (keyCode == KeyEvent.KEYCODE_MENU)
+        if (toolbar.isOverflowMenuShowing) toolbar.hideOverflowMenu() else toolbar.showOverflowMenu()
+    else super.onKeyUp(keyCode, event)
 
     override fun onDestroy() {
         instance = null

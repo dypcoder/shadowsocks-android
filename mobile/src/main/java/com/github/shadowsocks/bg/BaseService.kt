@@ -31,7 +31,6 @@ import android.os.RemoteCallbackList
 import android.support.v4.os.UserManagerCompat
 import android.util.Base64
 import android.util.Log
-import android.widget.Toast
 import com.github.shadowsocks.App.Companion.app
 import com.github.shadowsocks.R
 import com.github.shadowsocks.acl.Acl
@@ -50,7 +49,8 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
 import java.io.File
-import java.net.UnknownHostException
+import java.io.IOException
+import java.net.*
 import java.security.MessageDigest
 import java.util.*
 import java.util.concurrent.TimeUnit
@@ -76,7 +76,7 @@ object BaseService {
         @Volatile var state = STOPPED
         @Volatile var plugin = PluginOptions()
         @Volatile var pluginPath: String? = null
-        var sslocalProcess: GuardedProcess? = null
+        val processes = GuardedProcessPool()
 
         var timer: Timer? = null
         var trafficMonitorThread: TrafficMonitorThread? = null
@@ -88,17 +88,14 @@ object BaseService {
         val closeReceiver = broadcastReceiver { _, intent ->
             when (intent.action) {
                 Action.RELOAD -> service.forceLoad()
-                else -> {
-                    Toast.makeText(service as Context, R.string.stopping, Toast.LENGTH_SHORT).show()
-                    service.stopRunner(true)
-                }
+                else -> service.stopRunner(true)
             }
         }
         var closeReceiverRegistered = false
 
         val binder = object : IShadowsocksService.Stub() {
             override fun getState(): Int = this@Data.state
-            override fun getProfileName(): String = profile?.formattedName ?: "Idle"
+            override fun getProfileName(): String = profile?.name ?: "Idle"
 
             override fun registerCallback(cb: IShadowsocksServiceCallback) {
                 callbacks.register(cb)
@@ -109,6 +106,7 @@ object BaseService {
                         val t = Timer(true)
                         t.schedule(object : TimerTask() {
                             override fun run() {
+                                val profile = profile ?: return
                                 if (state == CONNECTED && TrafficMonitor.updateRate()) app.handler.post {
                                     if (bandwidthListeners.isNotEmpty()) {
                                         val txRate = TrafficMonitor.txRate
@@ -119,8 +117,11 @@ object BaseService {
                                         for (i in 0 until n) try {
                                             val item = callbacks.getBroadcastItem(i)
                                             if (bandwidthListeners.contains(item.asBinder()))
-                                                item.trafficUpdated(profile!!.id, txRate, rxRate, txTotal, rxTotal)
-                                        } catch (_: Exception) { }  // ignore
+                                                item.trafficUpdated(profile.id, txRate, rxRate, txTotal, rxTotal)
+                                        } catch (e: Exception) {
+                                            e.printStackTrace()
+                                            app.track(e)
+                                        }
                                         callbacks.finishBroadcast()
                                     }
                                 }
@@ -149,22 +150,35 @@ object BaseService {
         }
 
         internal fun updateTrafficTotal(tx: Long, rx: Long) {
-            val profile = profile ?: return
-            val p = ProfileManager.getProfile(profile.id) ?: return // profile may have host, etc. modified
-            p.tx += tx
-            p.rx += rx
-            ProfileManager.updateProfile(p)
-            app.handler.post {
-                if (bandwidthListeners.isNotEmpty()) {
-                    val n = callbacks.beginBroadcast()
-                    for (i in 0 until n) {
-                        try {
-                            val item = callbacks.getBroadcastItem(i)
-                            if (bandwidthListeners.contains(item.asBinder())) item.trafficPersisted(p.id)
-                        } catch (_: Exception) { }  // ignore
+            try {
+                // this.profile may have host, etc. modified and thus a re-fetch is necessary (possible race condition)
+                val profile = ProfileManager.getProfile((profile ?: return).id) ?: return
+                profile.tx += tx
+                profile.rx += rx
+                ProfileManager.updateProfile(profile)
+                app.handler.post {
+                    if (bandwidthListeners.isNotEmpty()) {
+                        val n = callbacks.beginBroadcast()
+                        for (i in 0 until n) {
+                            try {
+                                val item = callbacks.getBroadcastItem(i)
+                                if (bandwidthListeners.contains(item.asBinder())) item.trafficPersisted(profile.id)
+                            } catch (e: Exception) {
+                                e.printStackTrace()
+                                app.track(e)
+                            }
+                        }
+                        callbacks.finishBroadcast()
                     }
-                    callbacks.finishBroadcast()
                 }
+            } catch (e: IOException) {
+                if (!DataStore.directBootAware) throw e // we should only reach here because we're in direct boot
+                val profile = DirectBoot.getDeviceProfile()!!
+                profile.tx += tx
+                profile.rx += rx
+                profile.dirty = true
+                DirectBoot.update(profile)
+                DirectBoot.listenForUnlock()
             }
         }
 
@@ -185,9 +199,9 @@ object BaseService {
                         .put("plugin_opts", plugin.toString())
             }
             // sensitive Shadowsocks config is stored in
-            val file = File((if (UserManagerCompat.isUserUnlocked(app)) app.filesDir else @TargetApi(24) {
+            val file = File(if (UserManagerCompat.isUserUnlocked(app)) app.filesDir else @TargetApi(24) {
                 app.deviceContext.noBackupFilesDir  // only API 24+ will be in locked state
-            }), CONFIG_FILE)
+            }, CONFIG_FILE)
             shadowsocksConfigFile = file
             file.writeText(config.toString())
             return file
@@ -204,7 +218,10 @@ object BaseService {
                 val n = callbacks.beginBroadcast()
                 for (i in 0 until n) try {
                     callbacks.getBroadcastItem(i).stateChanged(s, binder.profileName, msg)
-                } catch (_: Exception) { }  // ignore
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    app.track(e)
+                }
                 callbacks.finishBroadcast()
             }
             state = s
@@ -221,9 +238,9 @@ object BaseService {
                     false
                 } else true
         fun forceLoad() {
-            val p = app.currentProfile
+            val profile = app.currentProfile
                     ?: return stopRunner(true, (this as Context).getString(R.string.profile_empty))
-            if (!checkProfile(p)) return
+            if (!checkProfile(profile)) return
             val s = data.state
             when (s) {
                 STOPPED -> startRunner()
@@ -239,6 +256,7 @@ object BaseService {
 
         fun startNativeProcesses() {
             val data = data
+            val profile = data.profile!!
             val cmd = buildAdditionalArguments(arrayListOf(
                     File((this as Context).applicationInfo.nativeLibraryDir, Executable.SS_LOCAL).absolutePath,
                     "-u",
@@ -253,9 +271,11 @@ object BaseService {
                 cmd += acl.absolutePath
             }
 
+            if (profile.udpdns) cmd += "-D"
+
             if (TcpFastOpen.sendEnabled) cmd += "--fast-open"
 
-            data.sslocalProcess = GuardedProcess(cmd).start()
+            data.processes.start(cmd)
         }
 
         fun createNotification(profileName: String): ServiceNotification
@@ -266,11 +286,7 @@ object BaseService {
             else startService(Intent(this, javaClass))
         }
 
-        fun killProcesses() {
-            val data = data
-            data.sslocalProcess?.destroy()
-            data.sslocalProcess = null
-        }
+        fun killProcesses() = data.processes.killAll()
 
         fun stopRunner(stopService: Boolean, msg: String? = null) {
             // channge the state
@@ -322,6 +338,7 @@ object BaseService {
                 stopRunner(true, getString(R.string.profile_empty))
                 return Service.START_NOT_STICKY
             }
+            profile.name = profile.formattedName    // save name for later queries
             data.profile = profile
 
             TrafficMonitor.reset()
@@ -344,20 +361,16 @@ object BaseService {
 
             data.changeState(CONNECTING)
 
-            thread {
+            thread("$tag-Connecting") {
                 try {
                     if (profile.host == "198.199.101.152") {
                         val client = OkHttpClient.Builder()
-                                .dns {
-                                    listOf((Dns.resolve(it, false) ?: throw UnknownHostException())
-                                            .parseNumericAddress())
-                                }
                                 .connectTimeout(10, TimeUnit.SECONDS)
                                 .writeTimeout(10, TimeUnit.SECONDS)
                                 .readTimeout(30, TimeUnit.SECONDS)
                                 .build()
                         val mdg = MessageDigest.getInstance("SHA-1")
-                        mdg.update(app.info.signatures[0].toByteArray())
+                        mdg.update(app.info.signaturesCompat.first().toByteArray())
                         val requestBody = FormBody.Builder()
                                 .add("sig", String(Base64.encode(mdg.digest(), 0)))
                                 .build()
@@ -386,7 +399,7 @@ object BaseService {
                     killProcesses()
 
                     if (!profile.host.isNumericAddress())
-                        profile.host = Dns.resolve(profile.host, true) ?: throw UnknownHostException()
+                        profile.host = InetAddress.getByName(profile.host).hostAddress ?: throw UnknownHostException()
 
                     startNativeProcesses()
 

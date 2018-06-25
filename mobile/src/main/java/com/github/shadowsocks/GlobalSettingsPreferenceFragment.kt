@@ -20,7 +20,6 @@
 
 package com.github.shadowsocks
 
-import android.app.admin.DevicePolicyManager
 import android.os.Build
 import android.os.Bundle
 import android.support.design.widget.Snackbar
@@ -32,35 +31,32 @@ import com.github.shadowsocks.preference.DataStore
 import com.github.shadowsocks.utils.DirectBoot
 import com.github.shadowsocks.utils.Key
 import com.github.shadowsocks.utils.TcpFastOpen
-import com.takisoft.fix.support.v7.preference.PreferenceFragmentCompatDividers
+import com.takisoft.fix.support.v7.preference.PreferenceFragmentCompat
 
-class GlobalSettingsPreferenceFragment : PreferenceFragmentCompatDividers() {
+class GlobalSettingsPreferenceFragment : PreferenceFragmentCompat() {
     override fun onCreatePreferencesFix(savedInstanceState: Bundle?, rootKey: String?) {
         preferenceManager.preferenceDataStore = DataStore.publicStore
         DataStore.initGlobal()
         addPreferencesFromResource(R.xml.pref_global)
         val boot = findPreference(Key.isAutoConnect) as SwitchPreference
-        val directBootAwareListener = Preference.OnPreferenceChangeListener { _, newValue ->
-            if (newValue as Boolean) DirectBoot.update() else DirectBoot.clean()
-            true
-        }
         boot.setOnPreferenceChangeListener { _, value ->
             BootReceiver.enabled = value as Boolean
-            directBootAwareListener.onPreferenceChange(null, DataStore.directBootAware)
+            true
         }
         boot.isChecked = BootReceiver.enabled
 
-        val dba = findPreference(Key.directBootAware)
-        if (Build.VERSION.SDK_INT >= 24 && context!!.getSystemService(DevicePolicyManager::class.java)
-                .storageEncryptionStatus == DevicePolicyManager.ENCRYPTION_STATUS_ACTIVE_PER_USER)
-            dba.onPreferenceChangeListener = directBootAwareListener else dba.parent!!.removePreference(dba)
+        val canToggleLocked = findPreference(Key.directBootAware)
+        if (Build.VERSION.SDK_INT >= 24) canToggleLocked.setOnPreferenceChangeListener { _, newValue ->
+            if (app.directBootSupported && newValue as Boolean) DirectBoot.update() else DirectBoot.clean()
+            true
+        } else canToggleLocked.parent!!.removePreference(canToggleLocked)
 
         val tfo = findPreference(Key.tfo) as SwitchPreference
         tfo.isChecked = TcpFastOpen.sendEnabled
         tfo.setOnPreferenceChangeListener { _, value ->
             val result = TcpFastOpen.enabled(value as Boolean)
             if (result != null && result != "Success.")
-                Snackbar.make(activity!!.findViewById(R.id.snackbar), result, Snackbar.LENGTH_LONG).show()
+                Snackbar.make(requireActivity().findViewById(R.id.snackbar), result, Snackbar.LENGTH_LONG).show()
             value == TcpFastOpen.sendEnabled
         }
         if (!TcpFastOpen.supported) {

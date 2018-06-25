@@ -20,7 +20,6 @@
 
 package com.github.shadowsocks.bg
 
-import android.content.Context
 import com.github.shadowsocks.App.Companion.app
 import com.github.shadowsocks.acl.Acl
 import com.github.shadowsocks.preference.DataStore
@@ -29,32 +28,22 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.net.Inet6Address
-import java.util.*
 
-/**
- * This object also uses WeakMap to simulate the effects of multi-inheritance, but more lightweight.
- */
 object LocalDnsService {
     interface Interface : BaseService.Interface {
-        var overtureProcess: GuardedProcess?
-            get() = overtureProcesses[this]
-            set(value) {
-                if (value == null) overtureProcesses.remove(this) else overtureProcesses[this] = value
-            }
-
         override fun startNativeProcesses() {
             super.startNativeProcesses()
             val data = data
             val profile = data.profile!!
 
-            fun makeDns(name: String, address: String, edns: Boolean = true): JSONObject {
+            fun makeDns(name: String, address: String, timeout: Int, edns: Boolean = true): JSONObject {
                 val dns = JSONObject()
                 .put("Name", name)
-                .put("Address", (when (address.parseNumericAddress()) {
+                .put("Address", when (address.parseNumericAddress()) {
                     is Inet6Address -> "[$address]"
                     else -> address
-                }) + ":53")
-                .put("Timeout", 3)
+                })
+                .put("Timeout", timeout)
                 .put("EDNSClientSubnet", JSONObject().put("Policy", "disable"))
                 if (edns) dns
                 .put("Protocol", "tcp")
@@ -73,10 +62,11 @@ object LocalDnsService {
                         .put("MinimumTTL", 120)
                         .put("CacheSize", 4096)
                 val remoteDns = JSONArray(profile.remoteDns.split(",")
-                        .mapIndexed { i, dns -> makeDns("UserDef-" + i, dns.trim()) })
+                        .mapIndexed { i, dns -> makeDns("UserDef-$i", dns.trim() + ":53", 12) })
                 val localDns = JSONArray(arrayOf(
-                        makeDns("Primary-1", "119.29.29.29", false),
-                        makeDns("Primary-2", "114.114.114.114", false)
+                        makeDns("Primary-1", "208.67.222.222:443", 9, false),
+                        makeDns("Primary-2", "119.29.29.29:53", 9, false),
+                        makeDns("Primary-3", "114.114.114.114:53", 9, false)
                 ))
 
                 when (profile.route) {
@@ -84,7 +74,6 @@ object LocalDnsService {
                             .put("PrimaryDNS", localDns)
                             .put("AlternativeDNS", remoteDns)
                             .put("IPNetworkFile", "china_ip_list.txt")
-                            .put("DomainFile", data.aclFile!!.absolutePath)
                     Acl.CHINALIST -> config
                             .put("PrimaryDNS", localDns)
                             .put("AlternativeDNS", remoteDns)
@@ -97,18 +86,10 @@ object LocalDnsService {
                 return file
             }
 
-            if (!profile.udpdns) overtureProcess = GuardedProcess(buildAdditionalArguments(arrayListOf(
+            if (!profile.udpdns) data.processes.start(buildAdditionalArguments(arrayListOf(
                     File(app.applicationInfo.nativeLibraryDir, Executable.OVERTURE).absolutePath,
                     "-c", buildOvertureConfig("overture.conf")
-            ))).start()
-        }
-
-        override fun killProcesses() {
-            super.killProcesses()
-            overtureProcess?.destroy()
-            overtureProcess = null
+            )))
         }
     }
-
-    private val overtureProcesses = WeakHashMap<Interface, GuardedProcess>()
 }
